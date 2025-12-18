@@ -10,19 +10,21 @@ from pathlib import Path
 import streamlit as st
 
 # ------------------------------------------------------------------------
-# Import paths & Django setup
+# Import paths
 # ------------------------------------------------------------------------
-# ROOT is ...\Translator\Translator
 ROOT = Path(__file__).resolve().parent
-# PROJECT_ROOT is ...\Translator (so 'core' and 'translator' packages are importable)
-PROJECT_ROOT = ROOT.parent
-sys.path.append(str(PROJECT_ROOT))
-# MUST set this BEFORE importing django or any models
-os.environ.setdefault("DJANGO_SETTINGS_MODULE", "core.settings")
-import django
-django.setup()
+sys.path.append(str(ROOT))
 
-# -------------------- Gemini / Vertex AI credentials setup (minimal) --------------------
+# -------------------- Optional Django Setup --------------------
+try:
+    os.environ.setdefault("DJANGO_SETTINGS_MODULE", "core.settings")
+    import django
+    django.setup()
+    HAS_DJANGO = True
+except Exception:
+    HAS_DJANGO = False
+
+# -------------------- Optional Gemini / Vertex AI credentials setup --------------------
 # This block loads environment variables (optionally from .env),
 # sets GOOGLE_APPLICATION_CREDENTIALS to your service account JSON,
 # and initializes Vertex AI for Gemini calls used in translator.utils.
@@ -40,7 +42,7 @@ DEFAULT_LOCATION = os.getenv("GCP_LOCATION", "us-central1")  # common Vertex AI 
 
 # If a local credentials file is present, set the env var so Google SDK uses it
 if not os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
-    cred_path = os.path.join(os.path.dirname(__file__), "credentials.json")
+    cred_path = os.path.join(ROOT, "credentials.json")
     if os.path.exists(cred_path):
         os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = cred_path
 
@@ -60,18 +62,17 @@ except Exception as _vertex_err:
 # Only used when engine == "google"
 from deep_translator import GoogleTranslator
 # Utilities from your fixed translator.utils
-from translator.utils import (
+# Local imports
+from utils import (
     LANGUAGE_SLUGS,
     chunk_text,
     translate_chunks,
     gemini_translate_text,
     gemini_translate_chunks,
     translate_text_simple,
-    rebuild_pdf,  # master dispatcher for overlay/reportlab modes
+    rebuild_pdf,
 )
-# OCR / PDF parsing helpers (your module that uses Tesseract etc.)
-# Ensure translator/PDF2text.py defines extract_text_for_validation & extract_blocks_from_pdf
-from translator.PDF2text import (
+from PDF2txt import (
     extract_text_for_validation,
     extract_blocks_from_pdf
 )
@@ -227,7 +228,7 @@ with col1:
     if input_method == "Text Input":
         source_text = st.text_area("Enter text to translate:", height=250)
     else:
-        uploaded_file = st.file_uploader("Upload PDF file:", type=["pdf"])
+        uploaded_file = st.file_uploader("Upload PDF or DOCX file:", type=["pdf", "docx"])
         if uploaded_file:
             st.success(f"File loaded: {uploaded_file.name}")
 
@@ -260,60 +261,78 @@ with col1:
         status = st.empty()
 
         if not source_text and not uploaded_file:
-            st.error("Please provide text or upload a PDF file.")
+            st.error("Please provide text or upload a file.")
         elif source_lang == target_lang:
             st.error("Source and target languages must be different.")
         else:
             try:
-                # PDF Upload path
+                # File Upload path (PDF or DOCX)
                 if uploaded_file:
-                    status.info("🔍 Analyzing PDF...")
-                    progress.progress(10)
-                    pdf_bytes = uploaded_file.read()
-                    buffer = io.BytesIO(pdf_bytes)
+                    file_ext = uploaded_file.name.split('.')[-1].lower()
+                    
+                    if file_ext == "pdf":
+                        status.info("🔍 Analyzing PDF...")
+                        progress.progress(10)
+                        pdf_bytes = uploaded_file.read()
+                        buffer = io.BytesIO(pdf_bytes)
 
-                    status.info("🧠 Processing with OCR...")
-                    progress.progress(30)
+                        status.info("🧠 Processing with OCR and Layout Analysis...")
+                        progress.progress(30)
 
-                    # This function should internally OCR pages and return structured blocks + metadata
-                    data = extract_blocks_from_pdf(
-                        buffer,
-                        source_lang=source_lang,
-                        target_lang=target_lang,
-                        engine=engine,
-                        debug=True
-                    )
-                    progress.progress(60)
-
-                    pages = data.get("pages", [])
-                    metadata = data.get("metadata", {})
-                    if not pages:
-                        st.error("No content could be extracted from the PDF.")
-                    else:
-                        status.info("📄 Rebuilding PDF...")
-                        progress.progress(85)
-
-                        tmp_path = save_bytes_to_temp_pdf(pdf_bytes)
-                        try:
-                            # Use master dispatcher with selected mode
-                            pdf_out = rebuild_pdf(pages, tmp_path, target_lang, mode=rebuild_mode)
-                            st.session_state["translated_pdf_bytes"] = pdf_out
-                        finally:
-                            try:
-                                os.remove(tmp_path)
-                            except Exception:
-                                pass
-
-                        progress.progress(100)
-                        elapsed = time.time() - start_time
-                        status.empty()
-                        st.success(
-                            f"✅ PDF translated successfully "
-                            f"Pages: {metadata.get('total_pages', len(pages))} "
-                            f"Engine: {metadata.get('engine', engine)} "
-                            f"Mode: {rebuild_mode} "
-                            f"Time: {elapsed:.1f}s"
+                        # This function should internally OCR pages and return structured blocks + metadata
+                        data = extract_blocks_from_pdf(
+                            buffer,
+                            source_lang=source_lang,
+                            target_lang=target_lang,
+                            engine=engine,
+                            debug=True
                         )
+                        progress.progress(60)
+
+                        pages = data.get("pages", [])
+                        metadata = data.get("metadata", {})
+                        if not pages:
+                            st.error("No content could be extracted from the PDF.")
+                        else:
+                            status.info("📄 Rebuilding PDF with 1:1 Layout...")
+                            progress.progress(85)
+
+                            tmp_path = save_bytes_to_temp_pdf(pdf_bytes)
+                            try:
+                                # Use master dispatcher with selected mode
+                                pdf_out = rebuild_pdf(pages, tmp_path, target_lang, mode=rebuild_mode)
+                                st.session_state["translated_pdf_bytes"] = pdf_out
+                                st.session_state["output_filename"] = f"translated_{uploaded_file.name}"
+                            finally:
+                                try:
+                                    os.remove(tmp_path)
+                                except Exception:
+                                    pass
+                    
+                    elif file_ext == "docx":
+                        status.info("🔍 Analyzing DOCX...")
+                        progress.progress(20)
+                        from DOCX2txt import translate_docx
+                        
+                        status.info("🌐 Translating Word Document...")
+                        progress.progress(50)
+                        docx_out = translate_docx(
+                            uploaded_file,
+                            source_lang=source_lang,
+                            target_lang=target_lang,
+                            engine=engine
+                        )
+                        
+                        st.session_state["translated_docx_bytes"] = docx_out
+                        st.session_state["output_filename"] = f"translated_{uploaded_file.name}"
+                        progress.progress(100)
+
+                    elapsed = time.time() - start_time
+                    status.empty()
+                    st.success(
+                        f"✅ Document translated successfully! "
+                        f"Time: {elapsed:.1f}s"
+                    )
 
                 # Text Input path
                 else:
@@ -375,7 +394,18 @@ with col2:
         st.download_button(
             "📥 Download Translated PDF",
             data=st.session_state["translated_pdf_bytes"],
-            file_name="translated_document.pdf",
+            file_name=st.session_state.get("output_filename", "translated_document.pdf"),
             mime="application/pdf",
+            use_container_width=True
+        )
+
+    # DOCX result
+    if st.session_state.get("translated_docx_bytes"):
+        st.markdown("### 📝 Translated DOCX Ready")
+        st.download_button(
+            "📥 Download Translated DOCX",
+            data=st.session_state["translated_docx_bytes"],
+            file_name=st.session_state.get("output_filename", "translated_document.docx"),
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             use_container_width=True
         )

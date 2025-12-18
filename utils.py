@@ -276,6 +276,12 @@ def _add_text_block(page: 'fitz.Page', block: Dict[str, Any], target_lang: str):
         if not text:
             return
         rect = fitz.Rect(bbox)
+        # 1. Mask original text (crucial for 1:1 look)
+        try:
+            page.draw_rect(rect, color=(1, 1, 1), fill=(1, 1, 1), overlay=True)
+        except Exception:
+            pass
+        # 2. Insert translated text
         max_height = rect.height
         font_size = min(max(int(max_height * 0.65), 8), 36)
         page.insert_textbox(
@@ -296,10 +302,17 @@ def _replace_image_block(page: 'fitz.Page', block: Dict[str, Any]):
         bbox = block.get('bbox')
         if not bbox:
             return
-        img_data_b64 = block.get('image_data')
-        if not img_data_b64:
+        img_data = block.get('image_data')
+        if not img_data:
             return
-        img_bytes = base64.b64decode(img_data_b64)
+        # Handle both raw bytes and base64
+        if isinstance(img_data, str):
+            try:
+                img_bytes = base64.b64decode(img_data)
+            except Exception:
+                return
+        else:
+            img_bytes = img_data
         rect = fitz.Rect(bbox)
         page.insert_image(rect, stream=img_bytes)
     except Exception as e:

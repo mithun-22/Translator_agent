@@ -22,10 +22,10 @@ pytesseract.pytesseract.tesseract_cmd = r"C:\Users\p90023739\Tesseract-OCR\tesse
 
 # Optional translation manager (best-effort import)
 try:
-    from .utils import translation_manager, TranslationResult
-except Exception:
+    from utils import translation_manager, TranslationResult
+except ImportError:
     try:
-        from utils import translation_manager, TranslationResult
+        from .utils import translation_manager, TranslationResult
     except Exception:
         translation_manager = None
         TranslationResult = None
@@ -470,11 +470,48 @@ class SmartPDFProcessor:
 
         return all_paragraphs
 
-    def _process_image_block(self, img_bytes, target_lang):
+    def _process_image_block(self, page, block, page_num, block_idx, source_lang, target_lang, engine):
+        """
+        Processes an image block: extracts it, and if it looks like a diagram/table, 
+        uses Gemini Vision to translate and inpaint it.
+        """
+        try:
+            # Extract image bytes from PDF
+            bbox = block.get("bbox")
+            if not bbox:
+                return {"type": "image", "bbox": None}
+            
+            pix = page.get_pixmap(clip=fitz.Rect(bbox), matrix=fitz.Matrix(2, 2))
+            img_bytes = pix.tobytes("png")
+            
+            # Use Gemini Vision for translation if engine is gemini
+            if engine == "gemini":
+                modified_image_b64 = self._translate_image_content(img_bytes, target_lang)
+                if modified_image_b64:
+                    return {
+                        "type": "image",
+                        "bbox": bbox,
+                        "image_data": modified_image_b64
+                    }
+            
+            # Fallback: just return the original image data
+            return {
+                "type": "image",
+                "bbox": bbox,
+                "image_data": base64.b64encode(img_bytes).decode()
+            }
+        except Exception as e:
+            logger.warning(f"Image processing failed on page {page_num}: {e}")
+            return {"type": "image", "bbox": block.get("bbox")}
+
+    def _translate_image_content(self, img_bytes, target_lang):
         """
         Sends image to Gemini -> Gets Text Coordinates -> Inpaints -> Draws Translated Text
         """
-        model = genai.GenerativeModel('gemini-2.5-flash')
+        if genai is None:
+            return None
+            
+        model = genai.GenerativeModel('gemini-1.5-flash')
         
         prompt = f"""
         Analyze this image (it may be a table, diagram, or chart).
