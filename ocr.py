@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 # -------------------------------------------
 # CONFIGURE TESSERACT (USER PROVIDED)
 # -------------------------------------------
-pytesseract.pytesseract.tesseract_cmd = r"C:\Users\p90023739\Tesseract-OCR\tesseract.exe"
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 # -------------------------------------------
 # FONT MAP (safe and corrected)

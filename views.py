@@ -79,8 +79,13 @@ def translate_view(request):
                         for chunk in source_file.chunks():
                             f.write(chunk)
                     request.session["original_pdf_path"] = temp_pdf_path
+                    
+                    # Stats for message
+                    total_tokens = metadata.get("total_tokens", 0)
+                    cost = metadata.get("estimated_cost_usd", 0.0)
+                    stats_msg = f" (Tokens: {total_tokens}, Est. Cost: ${cost:.4f})" if total_tokens else ""
 
-                    messages.success(request, f"PDF translated successfully!")
+                    messages.success(request, f"PDF translated successfully!{stats_msg}")
                     return redirect("download_pdf")
 
                 # =========================

@@ -70,8 +70,11 @@ from utils import (
     gemini_translate_text,
     gemini_translate_chunks,
     translate_text_simple,
+    translate_text_simple,
     rebuild_pdf,
+    estimate_tokens_and_cost,
 )
+
 from PDF2txt import (
     extract_text_for_validation,
     extract_blocks_from_pdf
@@ -205,6 +208,30 @@ with st.sidebar:
 
     st.divider()
     st.header("⚙️ Options")
+    
+    # Dependency Checks
+    with st.expander("System Health", expanded=False):
+        # Deep Translator
+        try:
+            import deep_translator
+            st.success("✔ deep_translator")
+        except ImportError:
+            st.error("❌ deep_translator missing")
+            
+        # Vertex AI
+        try:
+            import vertexai
+            st.success("✔ vertexai")
+        except ImportError:
+            st.warning("⚠ vertexai missing (using fallback)")
+            
+        # Tesseract
+        import shutil
+        if shutil.which("tesseract") or os.path.exists(r"C:\Program Files\Tesseract-OCR\tesseract.exe"):
+             st.success("✔ Tesseract found")
+        else:
+             st.warning("⚠ Tesseract not found in PATH")
+
     # Let the user choose how the output PDF is rebuilt
     pdf_rebuild_mode = st.selectbox(
         "PDF Rebuild Mode",
@@ -303,6 +330,20 @@ with col1:
                                 pdf_out = rebuild_pdf(pages, tmp_path, target_lang, mode=rebuild_mode)
                                 st.session_state["translated_pdf_bytes"] = pdf_out
                                 st.session_state["output_filename"] = f"translated_{uploaded_file.name}"
+                                
+                                # Show Stats
+                                text_tokens = metadata.get("text_tokens", 0)
+                                image_tokens = metadata.get("image_tokens", 0)
+                                total_tokens = metadata.get("total_tokens", 0)
+                                cost = metadata.get("estimated_cost_usd", 0.0)
+                                
+                                st.divider()
+                                k1, k2, k3, k4 = st.columns(4)
+                                k1.metric("Text Tokens", text_tokens)
+                                k2.metric("Image Tokens", image_tokens)
+                                k3.metric("Total Tokens", total_tokens)
+                                k4.metric("Est. Cost", f"${cost:.4f}")
+                                st.divider()
                             finally:
                                 try:
                                     os.remove(tmp_path)
@@ -353,12 +394,17 @@ with col1:
                     progress.progress(80)
 
                     st.session_state["translated_text"] = translated_text
+                    
+                    # Calculate stats
+                    stats = estimate_tokens_and_cost(len(source_text), 0)
+                    
                     st.session_state["translation_metadata"] = {
                         "source_lang": source_lang,
                         "target_lang": target_lang,
                         "engine": engine,
                         "character_count": len(source_text),
-                        "processing_time": time.time() - start_time
+                        "processing_time": time.time() - start_time,
+                        **stats
                     }
 
                     progress.progress(100)
@@ -371,13 +417,20 @@ with col1:
                 st.error(f"Translation failed: {str(e)}")
                 logger.error(f"Translation error: {e}", exc_info=True)
 
+
 with col2:
     st.subheader("📄 Results")
     # Text result + download as PDF
     if st.session_state.get("translated_text"):
         translated_text = st.session_state["translated_text"]
         metadata = st.session_state.get("translation_metadata", {})
+        
+        # Stats display for text
+        if "text_tokens" in metadata:
+             st.caption(f"Tokens: {metadata['total_tokens']} | Cost: ${metadata['estimated_cost_usd']:.5f}")
+
         st.text_area("Translated Text:", translated_text, height=250)
+
 
         pdf_bytes = generate_pdf_from_text(translated_text, metadata.get("target_lang", "default"))
         st.download_button(

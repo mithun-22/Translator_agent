@@ -18,17 +18,22 @@ from dataclasses import dataclass, asdict
 import numpy as np
 
 # Configure Tesseract binary path (user provided)
-pytesseract.pytesseract.tesseract_cmd = r"C:\Users\p90023739\Tesseract-OCR\tesseract.exe"
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 # Optional translation manager (best-effort import)
 try:
-    from utils import translation_manager, TranslationResult
-except ImportError:
+    from utils import translation_manager, TranslationResult, gemini_regenerate_image, estimate_tokens_and_cost
+except ImportError as e:
+    logger.warning(f"Direct import from utils failed: {e}")
     try:
-        from .utils import translation_manager, TranslationResult
-    except Exception:
+        from .utils import translation_manager, TranslationResult, gemini_regenerate_image, estimate_tokens_and_cost
+    except Exception as e2:
+        logger.error(f"Failed to import from utils: {e2}")
         translation_manager = None
         TranslationResult = None
+        gemini_regenerate_image = None
+        estimate_tokens_and_cost = None
+
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -259,6 +264,9 @@ class SmartPDFProcessor:
                 'runs': open("text_runs.json", "w", encoding="utf-8"),
                 'results': open("results.json", "w", encoding="utf-8")
             }
+        self.total_text_chars = 0
+        self.total_images = 0
+
 
     def __del__(self):
         for file in self.debug_files.values():
@@ -281,7 +289,11 @@ class SmartPDFProcessor:
                     "engine": engine,
                     "errors": [],
                     "tables_found": 0,
-                    "flowcharts_found": 0
+                    "flowcharts_found": 0,
+                    "text_tokens": 0,
+                    "image_tokens": 0,
+                    "total_tokens": 0,
+                    "estimated_cost_usd": 0.0
                 }
             }
 
@@ -296,6 +308,12 @@ class SmartPDFProcessor:
                     logger.error(error_msg)
                     results["metadata"]["errors"].append(error_msg)
                     results["pages"].append({"number": page_num, "blocks": [], "error": str(e)})
+
+            # Add Estimation Stats
+            if estimate_tokens_and_cost:
+                stats = estimate_tokens_and_cost(self.total_text_chars, self.total_images)
+                results["metadata"].update(stats)
+
 
             if self.debug_mode:
                 with open("final_results.json", "w", encoding="utf-8") as f:
@@ -382,6 +400,9 @@ class SmartPDFProcessor:
             if not original_text:
                 continue
 
+            self.total_text_chars += len(original_text)
+
+
             translated_text = original_text
             if translation_manager:
                 try:
@@ -394,7 +415,14 @@ class SmartPDFProcessor:
                     elif isinstance(res, dict):
                         translated_text = res.get("translated_text") or res.get("text") or translated_text
                 except Exception as e:
-                    logger.warning(f"Paragraph translation failed: {e}")
+                    logger.warning(f"Paragraph translation failed (Manager): {e}")
+            else:
+                # Emergency Fallback if manager failed to load but googletrans is available
+                try:
+                    from deep_translator import GoogleTranslator
+                    translated_text = GoogleTranslator(source=source_lang, target=target_lang).translate(original_text)
+                except Exception as e:
+                    logger.warning(f"Paragraph translation failed (Emergency Fallback): {e}")
 
             min_x = min(s['bbox'][0] for s in paragraph_spans)
             min_y = min(s['bbox'][1] for s in paragraph_spans)
@@ -485,16 +513,68 @@ class SmartPDFProcessor:
             img_bytes = pix.tobytes("png")
             
             # Use Gemini Vision for translation if engine is gemini
-            if engine == "gemini":
-                modified_image_b64 = self._translate_image_content(img_bytes, target_lang)
-                if modified_image_b64:
+            # Use Gemini Vision for translation if engine is gemini
+            self.total_images += 1
+            if engine == "gemini" and gemini_regenerate_image:
+                modified_bytes = gemini_regenerate_image(img_bytes, target_lang)
+                if modified_bytes:
                     return {
                         "type": "image",
                         "bbox": bbox,
-                        "image_data": modified_image_b64
+                        "image_data": base64.b64encode(modified_bytes).decode()
                     }
+                else:
+                    logger.warning(f"Gemini image regeneration failed for block {block_idx}. Using fallback.")
+
+            # Fallback: OCR or Return Original
+            # If no text was extracted from this page (scan?), we might want to OCR this image.
+            # But here we just return the image. 
+            # TODO: Add OCR call if needed.
             
-            # Fallback: just return the original image data
+            # OCR Fallback
+            image_text = ""
+            # Check if we can run OCR
+            if pytesseract and hasattr(pytesseract, "image_to_string"):
+                try:
+                    from PIL import Image as PILImage
+                    img_pil = PILImage.open(io.BytesIO(img_bytes))
+                    # Use provided path or default
+                    tesseract_lang = self._get_tesseract_lang_code(source_lang)
+                    image_text = pytesseract.image_to_string(img_pil, lang=tesseract_lang)
+                    image_text = image_text.strip()
+                    if image_text:
+                        logger.info(f"OCR extracted text from image block {block_idx} on page {page_num}: {image_text[:50]}...")
+                        # Translate OCR'd text
+                        translated_image_text = image_text
+                        if translation_manager:
+                            try:
+                                res = translation_manager.translate_text(image_text, source_lang, target_lang, engine)
+                                if isinstance(res, str):
+                                    translated_image_text = res
+                                elif hasattr(res, "translated_text"):
+                                    translated_image_text = res.translated_text
+                                elif isinstance(res, dict):
+                                    translated_image_text = res.get("translated_text") or res.get("text") or translated_image_text
+                            except Exception as e:
+                                logger.warning(f"OCR text translation failed: {e}")
+                        else:
+                            try:
+                                from deep_translator import GoogleTranslator
+                                translated_image_text = GoogleTranslator(source=source_lang, target=target_lang).translate(image_text)
+                            except Exception as e:
+                                logger.warning(f"OCR text translation (Emergency Fallback) failed: {e}")
+                        
+                        return {
+                            "type": "image",
+                            "bbox": bbox,
+                            "image_data": base64.b64encode(img_bytes).decode(),
+                            "image_text": image_text,
+                            "translated_image_text": translated_image_text
+                        }
+                except Exception as e:
+                    logger.warning(f"Tesseract OCR failed for image block {block_idx} on page {page_num}: {e}")
+
+
             return {
                 "type": "image",
                 "bbox": bbox,
@@ -503,6 +583,7 @@ class SmartPDFProcessor:
         except Exception as e:
             logger.warning(f"Image processing failed on page {page_num}: {e}")
             return {"type": "image", "bbox": block.get("bbox")}
+
 
     def _translate_image_content(self, img_bytes, target_lang):
         """

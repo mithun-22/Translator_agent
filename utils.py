@@ -28,8 +28,9 @@ except Exception:
 
 try:
     from deep_translator import GoogleTranslator
-except Exception:
+except Exception as e:
     GoogleTranslator = None  # type: ignore
+    logging.warning(f"Failed to import deep_translator: {e}")
 
 try:
     import google.generativeai as genai
@@ -40,8 +41,18 @@ try:
             genai.configure(api_key=_GEMINI_KEY)
         except Exception:
             pass
-except Exception:
+except Exception as e:
     genai = None  # type: ignore
+    logging.warning(f"Failed to import google.generativeai: {e}")
+
+
+try:
+    import vertexai
+    from vertexai.generative_models import GenerativeModel, Part, Image as VertexImage
+except Exception:
+    vertexai = None
+    GenerativeModel = Part = VertexImage = None
+
 
 # ReportLab imports
 try:
@@ -178,20 +189,42 @@ def translate_chunks(chunks: List[str], source_lang: str, target_lang: str) -> s
 
 def gemini_translate_text(text: str, source_lang: str, target_lang: str) -> str:
     """Translate a text using Gemini (Flash)."""
+    # 1. Try Vertex AI
+    if vertexai and GenerativeModel:
+        try:
+            model = GenerativeModel("gemini-2.5-flash")
+            prompt = (
+                f'Translate the following text from {source_lang} to {target_lang}.\n'
+                f'Output ONLY the translated text; keep line breaks and formatting.\n'
+                f'Text:\n{text}'
+            )
+            response = model.generate_content(prompt)
+            if response.text:
+                return response.text.strip()
+        except Exception as e:
+            logger.warning(f"Vertex AI Text Translation failed: {e}")
+
+    # 2. Fallback to genai
     if genai is None:
-        raise RuntimeError('google.generativeai is not available.')
-    model = genai.GenerativeModel('gemini-2.5-flash')
-    prompt = (
-        f'Translate the following text from {source_lang} to {target_lang}.\n'
-        f'Output ONLY the translated text; keep line breaks and formatting.\n'
-        f'Text:\n{text}'
-    )
-    response = model.generate_content(prompt, request_options={'timeout': 60})
-    if hasattr(response, 'text') and response.text:
-        return response.text.strip()
-    if hasattr(response, 'candidates') and response.candidates:
-        return response.candidates[0].content.parts[0].text.strip()
-    logger.warning(f'Unexpected Gemini response format: {response}')
+        if not vertexai:
+            raise RuntimeError('Neither Vertex AI nor google.generativeai is available.')
+    
+    if genai:
+        try:
+            model = genai.GenerativeModel('gemini-2.5-flash')
+            prompt = (
+                f'Translate the following text from {source_lang} to {target_lang}.\n'
+                f'Output ONLY the translated text; keep line breaks and formatting.\n'
+                f'Text:\n{text}'
+            )
+            response = model.generate_content(prompt, request_options={'timeout': 60})
+            if hasattr(response, 'text') and response.text:
+                return response.text.strip()
+            if hasattr(response, 'candidates') and response.candidates:
+                return response.candidates[0].content.parts[0].text.strip()
+        except Exception as e:
+            logger.warning(f"GenAI Text Translation failed: {e}")
+
     return ''
 
 
@@ -203,10 +236,100 @@ def gemini_translate_chunks(chunks: List[str], source_lang: str, target_lang: st
     return "\n\n".join(translated_chunks)
 
 
-def translate_text_simple(text: str, source_lang: str, target_lang: str, engine: str = 'google') -> str:
-    """Return translated text or original on failure."""
-    result = translation_manager.translate_text(text, source_lang, target_lang, engine)
     return result.translated_text if result.success else text
+
+
+def gemini_regenerate_image(img_bytes: bytes, target_lang: str) -> Optional[bytes]:
+    """
+    Regenerate an image (chart/diagram) with translated text using Gemini (Vertex AI).
+    Uses 'gemini-2.5-flash' as requested.
+    Returns bytes of the new image (PNG) or None if failed.
+    """
+    # 1. Try Vertex AI first (Production requirement)
+    if vertexai and GenerativeModel:
+        try:
+            model = GenerativeModel("gemini-2.5-flash")
+            
+            prompt = f"""
+            Translate all visible text in this image to {target_lang}.
+            Preserve layout, fonts, colors, spacing, table grids, arrows/connectors, and chart axes/legends.
+            Change ONLY the language of the text.
+            Output: Regenerated image only.
+            No text, no JSON, no markdown.
+            """
+            
+            # Create the image part
+            image_part = Part.from_data(data=img_bytes, mime_type="image/png")
+            
+            responses = model.generate_content(
+                [image_part, prompt],
+                stream=False
+            )
+            
+            # Check for image in response (Vertex AI returns Part with inline_data or similar)
+            # Note: Current Gemini public models return Text/JSON. 
+            # If 'gemini-2.5-flash' supports direct image generation from image+prompt (Image-to-Image),
+            # we expect a part with mime_type image/*.
+            # We implemented best-effort retrieval.
+            
+            if responses and responses.candidates:
+                for part in responses.candidates[0].content.parts:
+                    # Check if part is an image (inline_data)
+                    if hasattr(part, "inline_data") and part.inline_data:
+                         return part.inline_data.data # bytes
+                    # Some SDK versions use different attributes, guard accordingly:
+                    if hasattr(part, "file_data") and part.file_data:
+                         # This usually refers to stored file, but let's check
+                         pass
+            
+            # If no image found, log warning (Model might have returned text denying request)
+            logger.warning("Gemini did not return an image. Fallback to OCR required.")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Vertex AI Image Gen failed: {e}")
+            return None
+
+    # 2. Fallback to genai (AI Studio) if configured
+    if genai:
+        try:
+            model = genai.GenerativeModel('gemini-2.5-flash')
+            prompt = f"Translate text to {target_lang}. Return ONLY the image."
+            # Logic similar to Vertex but different SDK objects
+            # AI Studio python SDK usually doesn't support image output directly in generate_content yet 
+            # unless using specific beta flags. We return None to trigger fallback.
+            return None
+        except Exception:
+            return None
+
+    return None
+
+# ------------------------------------------------------------
+# Cost & Token Estimation
+# ------------------------------------------------------------
+COST_PER_1K_CHARS = 0.000125  # Approx Flash pricing
+COST_PER_IMAGE = 0.0004       # Approx Flash image pricing
+
+def estimate_tokens_and_cost(text_char_count: int, image_count: int) -> Dict[str, Any]:
+    """
+    1 token ~ 4 chars.
+    1 image ~ 700 tokens (approx, varies by resolution).
+    """
+    text_tokens = text_char_count // 4
+    image_tokens = image_count * 700
+    total_tokens = text_tokens + image_tokens
+    
+    # Cost (USD)
+    # Using rough estimates for 'Flash' models
+    estimated_cost = (total_tokens / 1000) * 0.00010  # generic simplified rate
+    
+    return {
+        "text_tokens": text_tokens,
+        "image_tokens": image_tokens,
+        "total_tokens": total_tokens,
+        "estimated_cost_usd": round(estimated_cost, 6)
+    }
+
 
 
 # ------------------------------------------------------------
