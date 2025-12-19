@@ -592,7 +592,7 @@ class SmartPDFProcessor:
         if genai is None:
             return None
             
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        model = genai.GenerativeModel('gemini-2.5-flash')
         
         prompt = f"""
         Analyze this image (it may be a table, diagram, or chart).
