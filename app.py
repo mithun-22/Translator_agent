@@ -70,7 +70,6 @@ from utils import (
     gemini_translate_text,
     gemini_translate_chunks,
     translate_text_simple,
-    translate_text_simple,
     rebuild_pdf,
     estimate_tokens_and_cost,
 )
