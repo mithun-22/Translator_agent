@@ -239,6 +239,53 @@ def gemini_translate_chunks(chunks: List[str], source_lang: str, target_lang: st
     return result.translated_text if result.success else text
 
 
+def _get_font_path(target_lang: str) -> Optional[str]:
+    """Resolve font path for a language, checking configured paths and system fallbacks."""
+    # 1. Try Configured FONTS
+    font_def = FONTS.get(target_lang, FONTS.get('default'))
+    if font_def:
+        fname, ffile = font_def
+        # paths to check
+        candidates = [
+            os.path.join(FONT_PATH, ffile),
+            os.path.join(os.path.dirname(__file__), "fonts", ffile),
+            os.path.join(os.path.dirname(__file__), "static", "fonts", ffile),
+            f"fonts/{ffile}",
+        ]
+        for c in candidates:
+            if os.path.exists(c):
+                return c
+
+    # 2. System Fallback (Windows)
+    system_map = {
+        'hi': 'Nirmala.ttf',  # Nirmala UI usually supports Indic
+        'bn': 'Nirmala.ttf',
+        'ta': 'Nirmala.ttf',
+        'te': 'Nirmala.ttf',
+        'kn': 'Nirmala.ttf',
+        'mr': 'Nirmala.ttf',
+        'gu': 'Nirmala.ttf',
+        'pa': 'Nirmala.ttf',
+        'zh': 'msyh.ttc',      # Microsoft YaHei
+        'ja': 'msgothic.ttc',  # MS Gothic
+        'ko': 'malgun.ttf',    # Malgun Gothic
+        'ar': 'arial.ttf',     # Arial often has Arabic
+        'ru': 'arial.ttf',
+        'th': 'Leelawadee.ttf',
+    }
+    sys_font = system_map.get(target_lang)
+    if sys_font:
+        sys_path = os.path.join(r"C:\Windows\Fonts", sys_font)
+        if os.path.exists(sys_path):
+            return sys_path
+    
+    # Generic fallback
+    if os.path.exists(r"C:\Windows\Fonts\arial.ttf"):
+        return r"C:\Windows\Fonts\arial.ttf"
+    
+    return None
+
+
 def gemini_regenerate_image(img_bytes: bytes, target_lang: str) -> Optional[bytes]:
     """
     Regenerate an image (chart/diagram) with translated text using Gemini (Vertex AI).
@@ -267,11 +314,6 @@ def gemini_regenerate_image(img_bytes: bytes, target_lang: str) -> Optional[byte
             )
             
             # Check for image in response (Vertex AI returns Part with inline_data or similar)
-            # Note: Current Gemini public models return Text/JSON. 
-            # If 'gemini-2.5-flash' supports direct image generation from image+prompt (Image-to-Image),
-            # we expect a part with mime_type image/*.
-            # We implemented best-effort retrieval.
-            
             if responses and responses.candidates:
                 for part in responses.candidates[0].content.parts:
                     # Check if part is an image (inline_data)
@@ -279,15 +321,19 @@ def gemini_regenerate_image(img_bytes: bytes, target_lang: str) -> Optional[byte
                          return part.inline_data.data # bytes
                     # Some SDK versions use different attributes, guard accordingly:
                     if hasattr(part, "file_data") and part.file_data:
-                         # This usually refers to stored file, but let's check
                          pass
             
             # If no image found, log warning (Model might have returned text denying request)
             logger.warning("Gemini did not return an image. Fallback to OCR required.")
+            if responses.text:
+                logger.info(f"Gemini Text Response detected (possible refusal): {responses.text[:200]}")
             return None
             
         except Exception as e:
             logger.error(f"Vertex AI Image Gen failed: {e}")
+            # Check if 404 Not Found (Model doesn't exist)
+            if "404" in str(e):
+                logger.error("Model gemini-2.5-flash not found in this region or project. Verify GCP_LOCATION and Model ID.")
             return None
 
     # 2. Fallback to genai (AI Studio) if configured
@@ -295,9 +341,6 @@ def gemini_regenerate_image(img_bytes: bytes, target_lang: str) -> Optional[byte
         try:
             model = genai.GenerativeModel('gemini-2.5-flash')
             prompt = f"Translate text to {target_lang}. Return ONLY the image."
-            # Logic similar to Vertex but different SDK objects
-            # AI Studio python SDK usually doesn't support image output directly in generate_content yet 
-            # unless using specific beta flags. We return None to trigger fallback.
             return None
         except Exception:
             return None
@@ -347,10 +390,23 @@ def rebuild_pdf_overlay(pages: List[Dict[str, Any]], original_pdf_path: str, tar
     try:
         original_doc = fitz.open(original_pdf_path)
     except Exception as e:
-        logger.error(f'âŒ Cannot open original PDF: {e}')
+        logger.error(f'â Œ Cannot open original PDF: {e}')
         raise
 
     output_doc = fitz.open()
+    
+    # Register Font for this document
+    font_path = _get_font_path(target_lang)
+    font_ref = 'helv'
+    if font_path:
+        try:
+            font_ref = f"custom_{target_lang}"
+            output_doc.insert_font(fontname=font_ref, fontfile=font_path)
+            logger.info(f"Registered generic font: {font_ref} from {font_path}")
+        except Exception as e:
+            logger.warning(f"Failed to register font {font_path}: {e}")
+            font_ref = 'helv'
+
     for p in pages:
         try:
             page_num = p.get('number', 1) - 1
@@ -369,13 +425,13 @@ def rebuild_pdf_overlay(pages: List[Dict[str, Any]], original_pdf_path: str, tar
                 try:
                     t = block.get('type')
                     if t == 'text':
-                        _add_text_block(output_page, block, target_lang)
+                        _add_text_block(output_page, block, target_lang, font_ref)
                     elif t == 'image' and block.get('image_data'):
                         _replace_image_block(output_page, block)
                     elif t == 'table':
-                        _add_table_block(output_page, block)
+                        _add_table_block(output_page, block, font_name=font_ref)
                     elif t == 'flowchart_node':
-                        _add_flowchart_node(output_page, block, target_lang)
+                        _add_flowchart_node(output_page, block, target_lang, font_name=font_ref)
                 except Exception as e:
                     logger.warning(f'Block failed on pg {page_num+1}: {e}')
         except Exception as e:
@@ -389,7 +445,7 @@ def rebuild_pdf_overlay(pages: List[Dict[str, Any]], original_pdf_path: str, tar
     return pdf_bytes
 
 
-def _add_text_block(page: 'fitz.Page', block: Dict[str, Any], target_lang: str):
+def _add_text_block(page: 'fitz.Page', block: Dict[str, Any], target_lang: str, font_name: str = 'helv'):
     """Overlay translated text within its bounding box."""
     try:
         bbox = block.get('bbox')
@@ -407,16 +463,31 @@ def _add_text_block(page: 'fitz.Page', block: Dict[str, Any], target_lang: str):
         # 2. Insert translated text
         max_height = rect.height
         font_size = min(max(int(max_height * 0.65), 8), 36)
-        page.insert_textbox(
-            rect,
-            text,
-            fontsize=font_size,
-            fontname='helv',
-            color=(0, 0, 0),
-            align=fitz.TEXT_ALIGN_LEFT,
-        )
+        
+        # Insert using the registered font
+        try:
+            res = page.insert_textbox(
+                rect,
+                text,
+                fontsize=font_size,
+                fontname=font_name,  # Use our Unicode-safe font
+                color=(0, 0, 0),
+                align=fitz.TEXT_ALIGN_LEFT,
+            )
+            # If result is negative (buffer too small), we might retry with smaller font
+            if res < 0:
+                page.insert_textbox(
+                    rect,
+                    text,
+                    fontsize=font_size - 2,
+                    fontname=font_name,
+                    color=(0, 0, 0),
+                )
+        except Exception as e:
+            logger.warning(f"Text insert failed: {e}")
+            
     except Exception as e:
-        logger.warning(f'âš  Text block failed: {e}')
+        logger.warning(f'⚠ Text block failed: {e}')
 
 
 def _replace_image_block(page: 'fitz.Page', block: Dict[str, Any]):
@@ -442,7 +513,7 @@ def _replace_image_block(page: 'fitz.Page', block: Dict[str, Any]):
         logger.warning(f'âš  Image insertion failed: {e}')
 
 
-def _add_table_block(page: 'fitz.Page', table: Dict[str, Any]):
+def _add_table_block(page: 'fitz.Page', table: Dict[str, Any], font_name: str = 'helv'):
     """Render a simple grid and place cell text."""
     try:
         bbox = table.get('bbox')
@@ -474,7 +545,7 @@ def _add_table_block(page: 'fitz.Page', table: Dict[str, Any]):
                         cell_rect,
                         txt,
                         fontsize=fontsize,
-                        fontname='helv',
+                        fontname=font_name, 
                         color=(0, 0, 0),
                         align=fitz.TEXT_ALIGN_LEFT,
                     )
@@ -484,7 +555,7 @@ def _add_table_block(page: 'fitz.Page', table: Dict[str, Any]):
         logger.warning(f'âš  Table render failed: {e}')
 
 
-def _add_flowchart_node(page: 'fitz.Page', node: Dict[str, Any], target_lang: str):
+def _add_flowchart_node(page: 'fitz.Page', node: Dict[str, Any], target_lang: str, font_name: str = 'helv'):
     """Render a filled rectangle and a centered label."""
     try:
         bbox = node.get('bbox')
@@ -503,7 +574,7 @@ def _add_flowchart_node(page: 'fitz.Page', node: Dict[str, Any], target_lang: st
                 rect,
                 text,
                 fontsize=fontsize,
-                fontname='helv',
+                fontname=font_name,
                 color=(0, 0, 0),
                 align=fitz.TEXT_ALIGN_CENTER,
             )
@@ -765,6 +836,12 @@ def _render_image_block_reportlab(c: 'canvas.Canvas', page: 'fitz.Page', origina
 # ------------------------------------------------------------
 # Master dispatcher
 # ------------------------------------------------------------
+def translate_text_simple(text: str, source_lang: str, target_lang: str, engine: str = 'google') -> str:
+    """Convenience wrapper for simple text translation."""
+    res = translation_manager.translate_text(text, source_lang, target_lang, engine)
+    return res.translated_text
+
+
 def rebuild_pdf(pages_or_translated_pages: List[Dict[str, Any]], original_pdf_path: str,
                 target_lang: str = 'default', mode: str = 'overlay') -> bytes:
     """
@@ -797,4 +874,6 @@ __all__ = [
     'rebuild_pdf_hybrid',
     'rebuild_pdf',
     'LANGUAGE_SLUGS',
+    'gemini_regenerate_image',
+    'estimate_tokens_and_cost',
 ]
