@@ -53,6 +53,24 @@ except Exception:
     vertexai = None
     GenerativeModel = Part = VertexImage = None
 
+if vertexai:
+    try:
+        vertexai.init(
+            project=os.environ.get("GCP_PROJECT"),
+            location=os.environ.get("GCP_LOCATION", "us-central1")
+        )
+    except Exception as e:
+        logger.warning(f"Vertex AI init failed: {e}")
+
+if vertexai:
+    try:
+        vertexai.init(
+            project=os.environ.get("GCP_PROJECT"),
+            location=os.environ.get("GCP_LOCATION", "us-central1")
+        )
+    except Exception as e:
+        logger.warning(f"Vertex AI init failed: {e}")
+
 
 # ReportLab imports
 try:
@@ -298,11 +316,13 @@ def gemini_regenerate_image(img_bytes: bytes, target_lang: str) -> Optional[byte
             model = GenerativeModel("gemini-2.5-flash")
             
             prompt = f"""
-            Translate all visible text in this image to {target_lang}.
-            Preserve layout, fonts, colors, spacing, table grids, arrows/connectors, and chart axes/legends.
-            Change ONLY the language of the text.
-            Output: Regenerated image only.
-            No text, no JSON, no markdown.
+            You are regenerating an image.
+            Translate ALL visible text to {target_lang}.
+            Preserve layout, fonts, colors, spacing, grid lines, arrows, connectors, axes, legends.
+            Do NOT change background, shapes, or alignment.
+            Change ONLY the language.
+            Return ONLY the regenerated image.
+            If you cannot return an image, return nothing.
             """
             
             # Create the image part
@@ -316,13 +336,18 @@ def gemini_regenerate_image(img_bytes: bytes, target_lang: str) -> Optional[byte
             # Check for image in response (Vertex AI returns Part with inline_data or similar)
             if responses and responses.candidates:
                 for part in responses.candidates[0].content.parts:
-                    # Check if part is an image (inline_data)
+                    # STRICT check: only accept real image bytes
                     if hasattr(part, "inline_data") and part.inline_data:
-                         return part.inline_data.data # bytes
-                    # Some SDK versions use different attributes, guard accordingly:
+                        mime = getattr(part.inline_data, "mime_type", "")
+                        data = getattr(part.inline_data, "data", None)
+                        if data and mime.startswith("image/"):
+                            logger.info("✅ Gemini returned valid regenerated image")
+                            return data
+                    
+                    # Some SDK versions use 'file_data' or different attributes
                     if hasattr(part, "file_data") and part.file_data:
                          pass
-            
+
             # If no image found, log warning (Model might have returned text denying request)
             logger.warning("Gemini did not return an image. Fallback to OCR required.")
             if responses.text:
@@ -455,14 +480,22 @@ def _add_text_block(page: 'fitz.Page', block: Dict[str, Any], target_lang: str, 
         if not text:
             return
         rect = fitz.Rect(bbox)
-        # 1. Mask original text (crucial for 1:1 look)
-        try:
-            page.draw_rect(rect, color=(1, 1, 1), fill=(1, 1, 1), overlay=True)
-        except Exception:
-            pass
+        
         # 2. Insert translated text
         max_height = rect.height
         font_size = min(max(int(max_height * 0.65), 8), 36)
+
+        # Mask ONLY text area lightly (User Preference)
+        try:
+            mask_rect = fitz.Rect(
+                rect.x0,
+                rect.y0,
+                rect.x1,
+                rect.y0 + min(rect.height, font_size * 1.5)
+            )
+            page.draw_rect(mask_rect, color=(1,1,1), fill=(1,1,1), overlay=True)
+        except Exception:
+            pass
         
         # Insert using the registered font
         try:
@@ -487,7 +520,7 @@ def _add_text_block(page: 'fitz.Page', block: Dict[str, Any], target_lang: str, 
             logger.warning(f"Text insert failed: {e}")
             
     except Exception as e:
-        logger.warning(f'⚠ Text block failed: {e}')
+        logger.warning(f'âš  Text block failed: {e}')
 
 
 def _replace_image_block(page: 'fitz.Page', block: Dict[str, Any]):
